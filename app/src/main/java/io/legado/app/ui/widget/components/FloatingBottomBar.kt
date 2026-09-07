@@ -63,10 +63,11 @@ import com.kyant.backdrop.highlight.Highlight
 import com.kyant.backdrop.shadow.InnerShadow
 import com.kyant.backdrop.shadow.Shadow
 import com.kyant.capsule.ContinuousCapsule
+import io.legado.app.domain.model.settings.customColors
 import io.legado.app.ui.animation.DampedDragAnimation
 import io.legado.app.ui.animation.InteractiveHighlight
-import io.legado.app.ui.config.themeConfig.ThemeConfig
 import io.legado.app.ui.theme.LegadoTheme
+import io.legado.app.ui.theme.LocalAppUiConfiguration
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -88,7 +89,7 @@ fun RowScope.FloatingBottomBarItem(
                 interactionSource = null,
                 indication = null,
                 role = Role.Tab,
-                onClick = onClick
+                onClick = onClick,
             )
             .fillMaxHeight()
             .weight(1f)
@@ -108,6 +109,7 @@ fun FloatingBottomBar(
     modifier: Modifier = Modifier,
     selectedIndex: () -> Int,
     onSelected: (index: Int) -> Unit,
+    onReselected: (index: Int) -> Unit = {},
     backdrop: Backdrop,
     tabsCount: Int,
     isBlurEnabled: Boolean = true,
@@ -115,15 +117,23 @@ fun FloatingBottomBar(
     content: @Composable RowScope.() -> Unit
 ) {
     val isInLightTheme = !LegadoTheme.isDark
-    val accentColor = if (ThemeConfig.enableDeepPersonalization && ThemeConfig.themeColor != 0) {
-        Color(ThemeConfig.themeColor)
+    val themeSettings = LocalAppUiConfiguration.current.theme
+    val customColors = themeSettings.customColors(LegadoTheme.isDark)
+    val hasCustomColors = themeSettings.appTheme == "12" &&
+        themeSettings.enableDeepPersonalization
+    val accentColor = if (hasCustomColors && customColors.primary != 0) {
+        Color(customColors.primary)
     } else {
         LegadoTheme.colorScheme.primary
     }
-    val containerColor = if (ThemeConfig.enableDeepPersonalization && ThemeConfig.secondaryThemeColor != 0) {
-        Color(ThemeConfig.secondaryThemeColor).copy(alpha = if (isBlurEnabled) ThemeConfig.bottomBarBlurAlpha / 100f else 1f)
+    val containerColor = if (hasCustomColors && customColors.secondary != 0) {
+        Color(customColors.secondary).copy(
+            alpha = if (isBlurEnabled) themeSettings.bottomBarBlurAlpha / 100f else 1f
+        )
     } else if (isBlurEnabled) {
-        LegadoTheme.colorScheme.surfaceContainer.copy(alpha = ThemeConfig.bottomBarBlurAlpha / 100f)
+        LegadoTheme.colorScheme.surfaceContainer.copy(
+            alpha = themeSettings.bottomBarBlurAlpha / 100f
+        )
     } else {
         LegadoTheme.colorScheme.surfaceContainer
     }
@@ -188,6 +198,8 @@ fun FloatingBottomBar(
                 animateToValue(targetIndex.toFloat())
                 if (targetIndex != selectedIndex()) {
                     onSelected(targetIndex)
+                } else {
+                    onReselected(targetIndex)
                 }
                 animationScope.launch {
                     offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
@@ -258,8 +270,11 @@ fun FloatingBottomBar(
                     effects = {
                         if (isBlurEnabled) {
                             vibrancy()
-                            blur(ThemeConfig.bottomBarBlurRadius.toFloat().dp.toPx())
-                            lens(ThemeConfig.bottomBarLensRadius.dp.toPx(), ThemeConfig.bottomBarLensRadius.dp.toPx())
+                            blur(themeSettings.bottomBarBlurRadius.toFloat().dp.toPx())
+                            lens(
+                                themeSettings.bottomBarLensRadius.dp.toPx(),
+                                themeSettings.bottomBarLensRadius.dp.toPx()
+                            )
                         }
                     },
                     highlight = {
@@ -315,8 +330,11 @@ fun FloatingBottomBar(
                             if (isBlurEnabled) {
                                 val progress = dampedDragAnimation.pressProgress
                                 vibrancy()
-                                blur(ThemeConfig.bottomBarBlurRadius.toFloat().dp.toPx())
-                                lens(ThemeConfig.bottomBarLensRadius.dp.toPx() * progress, ThemeConfig.bottomBarLensRadius.dp.toPx() * progress)
+                                blur(themeSettings.bottomBarBlurRadius.toFloat().dp.toPx())
+                                lens(
+                                    themeSettings.bottomBarLensRadius.dp.toPx() * progress,
+                                    themeSettings.bottomBarLensRadius.dp.toPx() * progress
+                                )
                             }
                         },
                         highlight = {

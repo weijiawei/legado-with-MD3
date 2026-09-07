@@ -1,21 +1,30 @@
 package io.legado.app.data.repository
 
 import android.content.Context
+import androidx.datastore.core.DataMigration
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.SharedPreferencesMigration
-import androidx.datastore.preferences.core.*
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.booleanPreferencesKey
+import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
-import io.legado.app.utils.putPrefBoolean
-import io.legado.app.utils.putPrefFloat
-import io.legado.app.utils.putPrefInt
-import io.legado.app.utils.putPrefLong
-import io.legado.app.utils.putPrefString
-import io.legado.app.utils.putPrefStringSet
-import io.legado.app.utils.removePref
+import io.legado.app.constant.PreferKey
+import io.legado.app.data.local.preferences.LocalPreferencesKeys
+import io.legado.app.data.local.preferences.localDataStore
+import io.legado.app.help.config.AppConfigStore
+import io.legado.app.help.config.compatDsValue
+import io.legado.app.help.config.rawPrefValue
+import io.legado.app.help.config.setPrefValue
+import java.io.IOException
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
-import java.io.IOException
 
 val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
     name = "settings",
@@ -24,56 +33,87 @@ val Context.dataStore: DataStore<Preferences> by preferencesDataStore(
             SharedPreferencesMigration(
                 context,
                 "${context.packageName}_preferences"
-            )
+            ),
+            LocalUiStatusMigration(context),
+            ShowBrightnessViewMigration,
         )
     }
 )
 
+internal class LocalUiStatusMigration(
+    private val context: Context,
+) : DataMigration<Preferences> {
+
+    override suspend fun shouldMigrate(currentData: Preferences): Boolean =
+        currentData[LocalPreferencesKeys.MIGRATED_TO_SETTINGS] != true
+
+    override suspend fun migrate(currentData: Preferences): Preferences {
+        val localPreferences = context.localDataStore.data
+            .catch { if (it is IOException) emit(emptyPreferences()) else throw it }
+            .first()
+        return mergeMissingLocalPreferences(currentData, localPreferences)
+    }
+
+    override suspend fun cleanUp() = Unit
+}
+
+internal fun mergeMissingLocalPreferences(
+    currentData: Preferences,
+    localPreferences: Preferences,
+): Preferences = currentData.toMutablePreferences().apply {
+    localPreferences.asMap().forEach { (key, value) ->
+        if (currentData.rawPrefValue(key.name) == null) {
+            setPrefValue(key.name, value)
+        }
+    }
+    this[LocalPreferencesKeys.MIGRATED_TO_SETTINGS] = true
+}
+
+internal object ShowBrightnessViewMigration : DataMigration<Preferences> {
+
+    private val booleanKey = booleanPreferencesKey(PreferKey.showBrightnessView)
+    private val stringKey = stringPreferencesKey(PreferKey.showBrightnessView)
+
+    override suspend fun shouldMigrate(currentData: Preferences): Boolean =
+        currentData.asMap().entries.any { (key, value) ->
+            key.name == PreferKey.showBrightnessView && value is Boolean
+        }
+
+    override suspend fun migrate(currentData: Preferences): Preferences {
+        val oldValue = currentData.asMap().entries
+            .firstOrNull { (key, value) ->
+                key.name == PreferKey.showBrightnessView && value is Boolean
+            }
+            ?.value as? Boolean
+            ?: return currentData
+        return currentData.toMutablePreferences().apply {
+            remove(booleanKey)
+            this[stringKey] = if (oldValue) "1" else "0"
+        }
+    }
+
+    override suspend fun cleanUp() = Unit
+}
+
 /**
  * 设置仓储
- * 采用 DataStore + SharedPreferences 桥接模式
- * 写入时同时写入两者，读取时以 DataStore 为准
- * 这样可以保持现有的基于 SP 的备份恢复功能正常工作
+ * 以 DataStore 为唯一持久化源，通过 [AppConfigStore] 的有效快照统一读写。
  */
-class SettingsRepository(private val context: Context) {
+class SettingsRepository {
 
-    private val dataStore = context.dataStore
+    fun <T : Any> getPreference(key: Preferences.Key<T>, defaultValue: T): Flow<T> =
+        AppConfigStore.preferencesFlow.map { it.compatDsValue(key, defaultValue) }
 
-    fun <T> getPreference(key: Preferences.Key<T>, defaultValue: T): Flow<T> {
-        return dataStore.data
-            .catch { exception ->
-                if (exception is IOException) {
-                    emit(emptyPreferences())
-                } else {
-                    throw exception
-                }
-            }
-            .map { preferences ->
-                preferences[key] ?: defaultValue
-            }
-    }
-
-    suspend fun <T> updatePreference(key: Preferences.Key<T>, value: T) {
-        // 1. 写入 DataStore (UI 响应式来源)
-        dataStore.edit { preferences ->
-            preferences[key] = value
-        }
-        // 2. 桥接：写回 SharedPreferences (保证备份功能正常)
-        syncToSharedPrefs(key.name, value)
-    }
-
-    private fun syncToSharedPrefs(key: String, value: Any?) {
+    suspend fun <T : Any> updatePreference(key: Preferences.Key<T>, value: T) {
         when (value) {
-            is String -> context.putPrefString(key, value)
-            is Int -> context.putPrefInt(key, value)
-            is Boolean -> context.putPrefBoolean(key, value)
-            is Long -> context.putPrefLong(key, value)
-            is Float -> context.putPrefFloat(key, value)
-            is Set<*> -> {
-                @Suppress("UNCHECKED_CAST")
-                context.putPrefStringSet(key, value as MutableSet<String>)
+            is String -> AppConfigStore.putString(key.name, value)
+            is Int -> AppConfigStore.putInt(key.name, value)
+            is Boolean -> AppConfigStore.putBoolean(key.name, value)
+            is Long -> AppConfigStore.putLong(key.name, value)
+            is Float -> AppConfigStore.putFloat(key.name, value)
+            is Set<*> -> @Suppress("UNCHECKED_CAST") {
+                AppConfigStore.putStringSet(key.name, value as Set<String>)
             }
-            null -> context.removePref(key)
         }
     }
 
@@ -82,17 +122,10 @@ class SettingsRepository(private val context: Context) {
         getPreference(stringPreferencesKey(key), defaultValue)
 
     suspend fun putString(key: String, value: String) =
-        updatePreference(stringPreferencesKey(key), value)
+        AppConfigStore.putString(key, value)
 
     suspend fun putStrings(values: Map<String, String>) {
-        dataStore.edit { preferences ->
-            values.forEach { (key, value) ->
-                preferences[stringPreferencesKey(key)] = value
-            }
-        }
-        values.forEach { (key, value) ->
-            syncToSharedPrefs(key, value)
-        }
+        AppConfigStore.putAll(values)
     }
 
     // Int 类型的快捷访问
@@ -130,34 +163,8 @@ class SettingsRepository(private val context: Context) {
     suspend fun putStringSet(key: String, value: Set<String>) =
         updatePreference(stringSetPreferencesKey(key), value)
 
-    // 批量从 Map 恢复到 DataStore (用于兼容 Restore 逻辑)
-    suspend fun batchPutFromMap(map: Map<String, *>) {
-        dataStore.edit { preferences ->
-            map.forEach { (key, value) ->
-                when (value) {
-                    is String -> preferences[stringPreferencesKey(key)] = value
-                    is Int -> preferences[intPreferencesKey(key)] = value
-                    is Boolean -> preferences[booleanPreferencesKey(key)] = value
-                    is Long -> preferences[longPreferencesKey(key)] = value
-                    is Float -> preferences[floatPreferencesKey(key)] = value
-                    is Set<*> -> {
-                        @Suppress("UNCHECKED_CAST")
-                        preferences[stringSetPreferencesKey(key)] = value as Set<String>
-                    }
-                }
-            }
-        }
-    }
-
     // 移除配置
     suspend fun remove(key: String) {
-        dataStore.edit { preferences ->
-            preferences.remove(stringPreferencesKey(key))
-            preferences.remove(intPreferencesKey(key))
-            preferences.remove(booleanPreferencesKey(key))
-            preferences.remove(longPreferencesKey(key))
-            preferences.remove(floatPreferencesKey(key))
-        }
-        context.removePref(key)
+        AppConfigStore.remove(key)
     }
 }

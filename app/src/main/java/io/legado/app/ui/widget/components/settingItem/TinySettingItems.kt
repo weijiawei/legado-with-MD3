@@ -33,11 +33,13 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -46,10 +48,18 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.disabled
+import androidx.compose.ui.semantics.role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.toggleableState
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import coil.compose.AsyncImage
+import coil3.compose.AsyncImage
 import io.legado.app.R
 import io.legado.app.ui.theme.LegadoTheme
 import io.legado.app.ui.widget.components.AccentColorButton
@@ -61,6 +71,28 @@ import io.legado.app.ui.widget.components.card.TextCard
 import io.legado.app.ui.widget.components.menuItem.RoundDropdownMenu
 import io.legado.app.ui.widget.components.menuItem.RoundDropdownMenuItem
 import io.legado.app.ui.widget.components.text.AppText
+
+/**
+ * 滑块拖拽状态：宿主（如阅读菜单）可在任意滑块拖动时据此降低自身透明度。
+ */
+@Stable
+class SliderDragState {
+    var isDragging by mutableStateOf(false)
+        private set
+
+    fun startDragging() {
+        isDragging = true
+    }
+
+    fun stopDragging() {
+        isDragging = false
+    }
+}
+
+/**
+ * 提供当前 [SliderDragState] 的 CompositionLocal；宿主不提供时为 null（不参与透明度联动）。
+ */
+val LocalSliderDragState = staticCompositionLocalOf<SliderDragState?> { null }
 
 @Composable
 fun TinySettingItem(
@@ -74,7 +106,11 @@ fun TinySettingItem(
     onExpandChange: ((Boolean) -> Unit)? = null,
     expandContent: (@Composable ColumnScope.() -> Unit)? = null,
     enabled: Boolean = true,
+    semanticRole: Role? = null,
+    semanticStateDescription: String? = null,
+    semanticToggleState: Boolean? = null,
     onClick: (() -> Unit)? = null,
+    onLongClick: (() -> Unit)? = null,
 ) {
     val isExpandable = expandContent != null && onExpandChange != null
     val alpha = if (enabled) 1f else 0.5f
@@ -88,10 +124,19 @@ fun TinySettingItem(
                 }
             }
         } else null,
+        onLongClick = if (enabled) onLongClick else null,
         modifier = modifier
             .padding(bottom = 4.dp)
             .heightIn(min = 56.dp)
-            .fillMaxWidth(),
+            .fillMaxWidth()
+            .semantics(mergeDescendants = true) {
+                semanticRole?.let { role = it }
+                semanticStateDescription?.let { stateDescription = it }
+                semanticToggleState?.let {
+                    toggleableState = if (it) ToggleableState.On else ToggleableState.Off
+                }
+                if (!enabled) disabled()
+            },
         cornerRadius = 12.dp,
         containerColor = color?.copy(alpha = alpha),
         contentColor = LegadoTheme.colorScheme.onSurface.copy(alpha = alpha),
@@ -173,6 +218,7 @@ fun TinySettingItem(
 fun TinyDropdownSettingItem(
     title: String,
     selectedValue: String,
+    selectedDisplay: String? = null,
     displayEntries: Array<String>,
     entryValues: Array<String>,
     description: String? = null,
@@ -182,7 +228,9 @@ fun TinyDropdownSettingItem(
     onValueChange: (String) -> Unit,
 ) {
     var showMenu by remember { mutableStateOf(false) }
-    val currentEntry = displayEntries.getOrNull(entryValues.indexOf(selectedValue)) ?: selectedValue
+    val currentEntry =
+        selectedDisplay ?: displayEntries.getOrNull(entryValues.indexOf(selectedValue))
+        ?: selectedValue
 
     Box(modifier = Modifier.fillMaxWidth()) {
         TinySettingItem(
@@ -241,11 +289,15 @@ fun TinySliderSettingItem(
     modifier: Modifier = Modifier,
     color: Color? = LegadoTheme.colorScheme.surfaceContainerLow,
     enabled: Boolean = true,
+    stepSize: Float = 1f,
+    showDecimal: Boolean = false,
+    valueFormat: ((Float) -> String)? = null,
     onValueChange: (Float) -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
     var sliderValue by remember(value) { mutableFloatStateOf(value) }
     var displayValue by remember(value) { mutableFloatStateOf(value) }
+    val dragState = LocalSliderDragState.current
 
     TinySettingItem(
         title = title,
@@ -263,6 +315,9 @@ fun TinySliderSettingItem(
                 valueRange = valueRange,
                 onValueChange = onValueChange,
                 enabled = enabled,
+                stepSize = stepSize,
+                showDecimal = showDecimal,
+                valueFormat = valueFormat,
             )
         },
         expandContent = {
@@ -271,14 +326,18 @@ fun TinySliderSettingItem(
                 onValueChange = {
                     sliderValue = it
                     displayValue = it
+                    onValueChange(it)
+                    dragState?.startDragging()
                 },
                 onValueChangeFinished = {
-                    onValueChange(sliderValue)
+                    dragState?.stopDragging()
                 },
                 valueRange = valueRange,
                 steps = steps,
                 enabled = enabled,
                 modifier = Modifier.fillMaxWidth(),
+                accessibilityLabel = title,
+                accessibilityValue = description ?: displayValue.toString(),
             )
         },
     )
@@ -309,11 +368,15 @@ fun TinySwitchSettingItem(
         modifier = modifier,
         color = color,
         enabled = enabled,
+        semanticRole = Role.Switch,
+        semanticToggleState = checked,
         trailingContent = {
             TinySwitch(
+                modifier = Modifier.clearAndSetSemantics { },
                 checked = checked,
                 onCheckedChange = onCheckedChange,
                 enabled = enabled,
+                includeStateSemantics = false,
             )
         },
         onClick = { onCheckedChange(!checked) },
@@ -329,6 +392,7 @@ fun TinyClickableSettingItem(
     color: Color? = LegadoTheme.colorScheme.surfaceContainerLow,
     trailingContent: (@Composable () -> Unit)? = null,
     onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null,
 ) {
     TinySettingItem(
         title = title,
@@ -345,6 +409,7 @@ fun TinyClickableSettingItem(
             )
         },
         onClick = onClick,
+        onLongClick = onLongClick,
     )
 }
 
@@ -488,9 +553,10 @@ private fun ColorModePill(
                 .offset { IntOffset(x = knobOffset.roundToPx(), y = 0) }
                 .size(knobSize)
                 .clip(CircleShape)
-                .background(
-                    if (currentColor != 0) Color(currentColor)
-                    else LegadoTheme.colorScheme.surfaceContainerLow
+                .background(LegadoTheme.colorScheme.surfaceContainerLow)
+                .then(
+                    if (currentColor != 0) Modifier.background(Color(currentColor))
+                    else Modifier
                 )
                 .clickable(
                     enabled = enabled,

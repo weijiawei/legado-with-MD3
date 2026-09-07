@@ -2,12 +2,12 @@ package io.legado.app.data.entities
 
 import androidx.room.Entity
 import androidx.room.PrimaryKey
-import java.util.UUID
+import kotlin.uuid.Uuid
 
 @Entity(tableName = "highlightRules")
 data class HighlightRule(
     @PrimaryKey
-    var id: String = UUID.randomUUID().toString(),
+    var id: String = Uuid.random().toString(),
     var name: String = "",
     var pattern: String = "",
     var sampleText: String = "",
@@ -24,6 +24,15 @@ data class HighlightRule(
     var bgImage: String? = null,
     var bgImageFit: Int = 0,
     var bgImageScale: Float = 1f,
+    var configName: String? = null,
+    var fontPath: String? = null,
+    var fontWeight: Int = 400,
+    var isItalic: Boolean = false,
+    var fontSizeOffset: Int = 0,
+    var npLeft: Float = 0.1f,
+    var npRight: Float = 0.1f,
+    var npTop: Float = 0.1f,
+    var npBottom: Float = 0.1f,
 ) {
 
     fun styleSummary(): String {
@@ -52,9 +61,16 @@ data class HighlightRule(
                 when (bgImageFit) {
                     1 -> "背景图(拉伸)"
                     2 -> "背景图(裁剪)"
+                    3 -> "背景图(九宫格)"
                     else -> "背景图(平铺)"
                 }
             )
+        }
+        if (!fontPath.isNullOrBlank()) {
+            parts.add("自定义字体")
+        }
+        if (fontSizeOffset != 0) {
+            parts.add("字号${if (fontSizeOffset > 0) "+" else ""}${fontSizeOffset}")
         }
         if (parts.isEmpty()) {
             parts.add("无样式")
@@ -81,7 +97,7 @@ data class HighlightRule(
     }
 
     fun copyWithNewId(): HighlightRule {
-        return copy(id = UUID.randomUUID().toString())
+        return copy(id = Uuid.random().toString())
     }
 
     companion object {

@@ -1,12 +1,16 @@
 package io.legado.app.domain.usecase
 
+import androidx.room.withTransaction
 import io.legado.app.constant.AppLog
 import io.legado.app.constant.BookType
+import io.legado.app.data.AppDatabase
 import io.legado.app.data.dao.BookChapterDao
 import io.legado.app.data.dao.BookDao
 import io.legado.app.data.entities.Book
 import io.legado.app.data.entities.BookChapter
 import io.legado.app.data.entities.BookSource
+import io.legado.app.domain.gateway.OtherSettingsGateway
+import io.legado.app.domain.gateway.ReadSettingsGateway
 import io.legado.app.help.book.BookHelp
 import io.legado.app.help.book.ContentProcessor
 import io.legado.app.help.book.isLocal
@@ -66,8 +70,11 @@ enum class BatchChangeSourcePreviewStatus {
 }
 
 class ChangeBookSourceUseCase(
+    private val database: AppDatabase,
     private val bookDao: BookDao,
     private val bookChapterDao: BookChapterDao,
+    private val otherSettingsGateway: OtherSettingsGateway,
+    private val readSettingsGateway: ReadSettingsGateway,
 ) {
 
     fun applyMigration(
@@ -76,12 +83,18 @@ class ChangeBookSourceUseCase(
         chapters: List<BookChapter>,
         options: ChangeSourceMigrationOptions,
     ): Book {
-        oldBook.applyMigrationTo(newBook, chapters, options)
+        oldBook.applyMigrationTo(
+            newBook,
+            chapters,
+            options,
+            otherSettingsGateway.currentSettings.replaceEnableDefault,
+            readSettingsGateway.currentSettings.chineseConverterType,
+        )
         newBook.removeType(BookType.updateError)
         return newBook
     }
 
-    fun changeTo(
+    suspend fun changeTo(
         oldBook: Book,
         newBook: Book,
         chapters: List<BookChapter>,
@@ -94,11 +107,15 @@ class ChangeBookSourceUseCase(
         } else if (oldBook.bookUrl != newBook.bookUrl) {
             BookHelp.updateCacheFolder(oldBook, newBook)
         }
-        bookChapterDao.delByBook(oldBook.bookUrl)
-        bookDao.delete(oldBook)
-        bookDao.insert(newBook)
+        database.withTransaction {
+            bookChapterDao.delByBook(oldBook.bookUrl)
+            bookDao.delete(oldBook)
+            bookDao.insert(newBook)
+            if (options.migrateChapters) {
+                bookChapterDao.insert(*chapters.toTypedArray())
+            }
+        }
         if (options.migrateChapters) {
-            bookChapterDao.insert(*chapters.toTypedArray())
             ReadBook.onChapterListUpdated(newBook)
         }
         return ChangeBookSourceResult(oldBookUrl, newBook)
@@ -232,6 +249,8 @@ class ChangeBookSourceUseCase(
         newBook: Book,
         chapters: List<BookChapter>,
         options: ChangeSourceMigrationOptions,
+        defaultReplaceEnabled: Boolean,
+        chineseConverterType: Int,
     ) {
         newBook.totalChapterNum = chapters.size
         if (options.migrateReadingProgress && chapters.isNotEmpty()) {
@@ -240,7 +259,8 @@ class ChangeBookSourceUseCase(
                 .coerceIn(0, chapters.lastIndex)
             newBook.durChapterTitle = chapters[newBook.durChapterIndex].getDisplayTitle(
                 ContentProcessor.get(newBook.name, newBook.origin).getTitleReplaceRules(),
-                getUseReplaceRule()
+                getUseReplaceRule(defaultReplaceEnabled),
+                chineseConverterType = chineseConverterType,
             )
             newBook.durChapterPos = durChapterPos
             newBook.durChapterTime = durChapterTime
@@ -248,7 +268,8 @@ class ChangeBookSourceUseCase(
             newBook.durChapterIndex = 0
             newBook.durChapterTitle = chapters.firstOrNull()?.getDisplayTitle(
                 ContentProcessor.get(newBook.name, newBook.origin).getTitleReplaceRules(),
-                getUseReplaceRule()
+                getUseReplaceRule(defaultReplaceEnabled),
+                chineseConverterType = chineseConverterType,
             )
             newBook.durChapterPos = 0
             newBook.durChapterTime = System.currentTimeMillis()
@@ -273,6 +294,9 @@ class ChangeBookSourceUseCase(
         }
         if (options.migrateReadConfig) {
             newBook.readConfig = readConfig
+        }
+        if (newBook.wordCount.isNullOrBlank()) {
+            newBook.wordCount = wordCount
         }
     }
 }

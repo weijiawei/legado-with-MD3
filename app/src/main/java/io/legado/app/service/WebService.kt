@@ -16,6 +16,7 @@ import io.legado.app.constant.IntentAction
 import io.legado.app.constant.NotificationId
 import io.legado.app.constant.PreferKey
 import io.legado.app.receiver.NetworkChangedListener
+import io.legado.app.domain.gateway.OtherSettingsGateway
 import io.legado.app.utils.NetworkUtils
 import io.legado.app.utils.eventBus.FlowEventBus
 import io.legado.app.utils.getPrefBoolean
@@ -30,12 +31,17 @@ import io.legado.app.utils.startService
 import io.legado.app.utils.stopService
 import io.legado.app.utils.toastOnUi
 import io.legado.app.web.KtorServer
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
+import org.koin.android.ext.android.inject
 import splitties.init.appCtx
 import splitties.systemservices.powerManager
 import splitties.systemservices.wifiManager
 import java.io.IOException
 
 class WebService : BaseService() {
+
+    private val otherSettingsGateway by inject<OtherSettingsGateway>()
 
     companion object {
         var isRun = false
@@ -118,7 +124,9 @@ class WebService : BaseService() {
         when (intent?.action) {
             IntentAction.stop -> {
                 // ——————【修改开始】通知栏点击停止时，也记录关闭状态——————
-                appCtx.putPrefBoolean("web_service_auto", false)
+                lifecycleScope.launch {
+                    otherSettingsGateway.update { it.copy(webServiceAutoStart = false) }
+                }
                 stopSelf()
                 // ——————【修改结束】——————
             }

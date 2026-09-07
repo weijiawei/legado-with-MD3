@@ -28,6 +28,7 @@ import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.TextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -45,6 +46,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
@@ -56,6 +59,7 @@ import io.legado.app.R
 import io.legado.app.data.entities.SearchBook
 import io.legado.app.data.entities.SearchKeyword
 import io.legado.app.domain.model.BookShelfState
+import io.legado.app.domain.model.ContentQualityStage
 import io.legado.app.domain.model.MatchMode
 import io.legado.app.ui.main.bookCoverSharedElementKey
 import io.legado.app.ui.main.bookshelf.BookShelfItem
@@ -80,6 +84,7 @@ import io.legado.app.ui.widget.components.list.TopFloatingStickyItem
 import io.legado.app.ui.widget.components.modalBottomSheet.AppModalBottomSheet
 import io.legado.app.ui.widget.components.progressIndicator.AppCircularProgressIndicator
 import io.legado.app.ui.widget.components.settingItem.CompactDropdownSettingItem
+import io.legado.app.ui.widget.components.settingItem.CompactClickableSettingItem
 import io.legado.app.ui.widget.components.text.AppText
 import io.legado.app.ui.widget.components.topbar.GlassMediumFlexibleTopAppBar
 import io.legado.app.ui.widget.components.topbar.GlassTopAppBarDefaults
@@ -93,7 +98,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 
 @OptIn(FlowPreview::class, ExperimentalMaterial3Api::class, ExperimentalSharedTransitionApi::class)
 @Composable
-fun SearchScreen(
+fun SearchRouteScreen(
     viewModel: SearchViewModel,
     onBack: () -> Unit,
     onOpenBookInfo: (name: String, author: String, bookUrl: String, origin: String?, coverPath: String?, sharedCoverKey: String?) -> Unit,
@@ -103,79 +108,6 @@ fun SearchScreen(
 ) {
     val context = LocalContext.current
     val state by viewModel.uiState.collectAsStateWithLifecycle()
-    val searchLayoutMode by viewModel.searchLayoutMode.collectAsStateWithLifecycle()
-    val isSourceGroupedMode = searchLayoutMode == 1
-    var previewBook by remember { mutableStateOf<SearchBook?>(null) }
-    var previewSharedCoverKey by remember { mutableStateOf<String?>(null) }
-    val listState = rememberLazyListState()
-    val groupedListState = rememberLazyListState()
-    val lifecycleOwner = LocalLifecycleOwner.current
-    var queryInput by rememberSaveable { mutableStateOf(state.query) }
-    var ignoreNextDebouncedQuery by rememberSaveable { mutableStateOf<String?>(null) }
-    val showSuggestionPanel = state.showSuggestions
-    val latestQuery by rememberUpdatedState(state.query)
-    val scrollBehavior = if (ThemeResolver.isMiuixEngine(LegadoTheme.composeEngine)) {
-        GlassTopAppBarDefaults.defaultScrollBehavior()
-    } else {
-        M3GlassScrollBehavior(TopAppBarDefaults.enterAlwaysScrollBehavior())
-    }
-
-    val shouldLoadMore by remember {
-        derivedStateOf {
-            val totalCount = listState.layoutInfo.totalItemsCount
-            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
-            totalCount > 0 && lastVisible >= totalCount - 3
-        }
-    }
-
-    val shouldLoadMoreGrouped by remember {
-        derivedStateOf {
-            val totalCount = groupedListState.layoutInfo.totalItemsCount
-            val lastVisible = groupedListState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
-            totalCount > 0 && lastVisible >= totalCount - 3
-        }
-    }
-
-    LaunchedEffect(state.query) {
-        if (state.query != queryInput) {
-            queryInput = state.query
-        }
-    }
-
-    LaunchedEffect(Unit) {
-        snapshotFlow { queryInput }
-            .distinctUntilChanged()
-            .debounce(200)
-            .collect { newQuery ->
-                if (ignoreNextDebouncedQuery == newQuery) {
-                    ignoreNextDebouncedQuery = null
-                    return@collect
-                }
-                if (newQuery != latestQuery) {
-                    viewModel.onIntent(SearchIntent.UpdateQuery(newQuery))
-                }
-            }
-    }
-
-    LaunchedEffect(
-        shouldLoadMore,
-        shouldLoadMoreGrouped,
-        state.isSearching,
-        state.hasMore,
-        state.isManualStop,
-        state.showSuggestions,
-        isSourceGroupedMode,
-    ) {
-        val readyToLoad = !state.isSearching &&
-            state.hasMore &&
-            !state.isManualStop &&
-            !state.showSuggestions
-        val nearEnd = if (isSourceGroupedMode) shouldLoadMoreGrouped else shouldLoadMore
-        if (readyToLoad && nearEnd) {
-            viewModel.onIntent(SearchIntent.LoadMore)
-        }
-    }
-
     LaunchedEffect(viewModel) {
         viewModel.effects.collect { effect ->
             when (effect) {
@@ -196,12 +128,93 @@ fun SearchScreen(
         }
     }
 
+    SearchScreen(
+        state = state,
+        onIntent = viewModel::onIntent,
+        onBack = onBack,
+        sharedTransitionScope = sharedTransitionScope,
+        animatedVisibilityScope = animatedVisibilityScope,
+    )
+}
+
+@OptIn(FlowPreview::class, ExperimentalMaterial3Api::class, ExperimentalSharedTransitionApi::class)
+@Composable
+fun SearchScreen(
+    state: SearchUiState,
+    onIntent: (SearchIntent) -> Unit,
+    onBack: () -> Unit,
+    sharedTransitionScope: SharedTransitionScope? = null,
+    animatedVisibilityScope: AnimatedVisibilityScope? = null,
+) {
+    val searchLayoutMode = state.layoutMode
+    val isSourceGroupedMode = searchLayoutMode == 1
+    var previewBook by remember { mutableStateOf<SearchBook?>(null) }
+    var previewSharedCoverKey by remember { mutableStateOf<String?>(null) }
+    val listState = rememberLazyListState()
+    val groupedListState = rememberLazyListState()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
+    var queryInput by rememberSaveable { mutableStateOf(state.query) }
+    var ignoreNextDebouncedQuery by rememberSaveable { mutableStateOf<String?>(null) }
+    var keepResultsPinnedToTop by rememberSaveable { mutableStateOf(true) }
+    val showSuggestionPanel = state.showSuggestions
+    val latestQuery by rememberUpdatedState(state.query)
+    val scrollBehavior = if (ThemeResolver.isMiuixEngine(LegadoTheme.composeEngine)) {
+        GlassTopAppBarDefaults.defaultScrollBehavior()
+    } else {
+        M3GlassScrollBehavior(TopAppBarDefaults.enterAlwaysScrollBehavior())
+    }
+    val shouldLoadMore by remember {
+        derivedStateOf {
+            val totalCount = listState.layoutInfo.totalItemsCount
+            val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+            totalCount > 0 && lastVisible >= totalCount - 3
+        }
+    }
+    val shouldLoadMoreGrouped by remember {
+        derivedStateOf {
+            val totalCount = groupedListState.layoutInfo.totalItemsCount
+            val lastVisible = groupedListState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1
+            totalCount > 0 && lastVisible >= totalCount - 3
+        }
+    }
+    LaunchedEffect(state.query) {
+        if (state.query != queryInput) queryInput = state.query
+    }
+    LaunchedEffect(Unit) {
+        snapshotFlow { queryInput }
+            .distinctUntilChanged()
+            .debounce(200)
+            .collect { newQuery ->
+                if (ignoreNextDebouncedQuery == newQuery) {
+                    ignoreNextDebouncedQuery = null
+                    return@collect
+                }
+                if (newQuery != latestQuery) onIntent(SearchIntent.UpdateQuery(newQuery))
+            }
+    }
+    LaunchedEffect(
+        shouldLoadMore,
+        shouldLoadMoreGrouped,
+        state.isSearching,
+        state.hasMore,
+        state.isManualStop,
+        state.showSuggestions,
+        isSourceGroupedMode,
+    ) {
+        val readyToLoad = !state.isSearching && state.hasMore &&
+            !state.isManualStop && !state.showSuggestions
+        val nearEnd = if (isSourceGroupedMode) shouldLoadMoreGrouped else shouldLoadMore
+        if (readyToLoad && nearEnd) onIntent(SearchIntent.LoadMore)
+    }
+
     // Activity lifecycle (e.g., Home button, switching apps)
-    DisposableEffect(lifecycleOwner, viewModel) {
+    DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             when (event) {
-                Lifecycle.Event.ON_RESUME -> viewModel.onIntent(SearchIntent.ResumeEngine)
-                Lifecycle.Event.ON_PAUSE -> viewModel.onIntent(SearchIntent.PauseEngine)
+                Lifecycle.Event.ON_RESUME -> onIntent(SearchIntent.ResumeEngine)
+                Lifecycle.Event.ON_PAUSE -> onIntent(SearchIntent.PauseEngine)
                 else -> Unit
             }
         }
@@ -212,23 +225,23 @@ fun SearchScreen(
     }
 
     // Composition lifecycle (e.g., navigating to BookInfo and back)
-    DisposableEffect(viewModel) {
+    DisposableEffect(Unit) {
         onDispose {
-            viewModel.onIntent(SearchIntent.PauseEngine)
+            onIntent(SearchIntent.PauseEngine)
         }
     }
 
-    LaunchedEffect(viewModel) {
-        viewModel.onIntent(SearchIntent.ResumeEngine)
+    LaunchedEffect(Unit) {
+        onIntent(SearchIntent.ResumeEngine)
     }
 
     // Save scroll position before composable leaves composition (e.g., navigating to BookInfo)
-    DisposableEffect(viewModel) {
+    DisposableEffect(Unit) {
         onDispose {
             val first = listState.firstVisibleItemIndex
             val offset = listState.firstVisibleItemScrollOffset
             if (first > 0 || offset > 0) {
-                viewModel.onIntent(SearchIntent.SaveScrollState(first, offset))
+                onIntent(SearchIntent.SaveScrollState(first, offset))
             }
         }
     }
@@ -239,7 +252,38 @@ fun SearchScreen(
         val off = state.savedScrollOffset
         if (idx > 0 || off > 0) {
             listState.scrollToItem(idx, off)
-            viewModel.onIntent(SearchIntent.SaveScrollState(0, 0))
+            onIntent(SearchIntent.SaveScrollState(0, 0))
+        }
+    }
+
+    LaunchedEffect(state.committedQuery) {
+        keepResultsPinnedToTop = true
+    }
+
+    LaunchedEffect(isSourceGroupedMode, listState, groupedListState) {
+        snapshotFlow {
+            val activeState = if (isSourceGroupedMode) groupedListState else listState
+            Triple(
+                activeState.firstVisibleItemIndex,
+                activeState.firstVisibleItemScrollOffset,
+                activeState.isScrollInProgress
+            )
+        }.collect { (index, offset, isScrollInProgress) ->
+            if (index == 0 && offset == 0) {
+                keepResultsPinnedToTop = true
+            } else if (isScrollInProgress) {
+                keepResultsPinnedToTop = false
+            }
+        }
+    }
+
+    val firstResultKey = state.results.firstOrNull()?.let {
+        "${it.book.origin}:${it.book.bookUrl}"
+    }
+    LaunchedEffect(firstResultKey, state.results.size, state.isSearching) {
+        if (state.isSearching && keepResultsPinnedToTop && state.results.isNotEmpty()) {
+            listState.scrollToItem(0)
+            groupedListState.scrollToItem(0)
         }
     }
 
@@ -249,9 +293,9 @@ fun SearchScreen(
             ignoreNextDebouncedQuery = normalized
             queryInput = normalized
             if (normalized != state.query) {
-                viewModel.onIntent(SearchIntent.UpdateQuery(normalized))
+                onIntent(SearchIntent.UpdateQuery(normalized))
             }
-            viewModel.onIntent(SearchIntent.SubmitSearch)
+            onIntent(SearchIntent.SubmitSearch)
         }
     }
 
@@ -279,7 +323,9 @@ fun SearchScreen(
                         TopBarAnimatedActionButton(
                             checked = isSourceGroupedMode || state.selectedSourceTypes.isNotEmpty(),
                             onCheckedChange = {
-                                viewModel.onIntent(SearchIntent.SetSettingsSheetVisible(true))
+                                focusManager.clearFocus(force = true)
+                                keyboardController?.hide()
+                                onIntent(SearchIntent.SetSettingsSheetVisible(true))
                             },
                             iconChecked = AppIcons.Settings,
                             iconUnchecked = AppIcons.Settings,
@@ -290,7 +336,7 @@ fun SearchScreen(
                             checked = state.matchMode == MatchMode.EXACT,
                             onCheckedChange = {
                                 val newMode = if (state.matchMode == MatchMode.EXACT) MatchMode.DEFAULT else MatchMode.EXACT
-                                viewModel.onIntent(SearchIntent.SetMatchMode(newMode))
+                                onIntent(SearchIntent.SetMatchMode(newMode))
                             },
                             iconChecked = AppIcons.PrecisionSearch,
                             iconUnchecked = AppIcons.UnPrecisionSearch,
@@ -300,7 +346,9 @@ fun SearchScreen(
                         TopBarAnimatedActionButton(
                             checked = !state.isAllScope,
                             onCheckedChange = {
-                                viewModel.onIntent(SearchIntent.SetScopeSheetVisible(true))
+                                focusManager.clearFocus(force = true)
+                                keyboardController?.hide()
+                                onIntent(SearchIntent.SetScopeSheetVisible(true))
                             },
                             iconChecked = AppIcons.Filter,
                             iconUnchecked = AppIcons.Filter,
@@ -328,7 +376,7 @@ fun SearchScreen(
                                     modifier = Modifier.padding(horizontal = 8.dp),
                                     onClick = {
                                         queryInput = ""
-                                        viewModel.onIntent(SearchIntent.UpdateQuery(""))
+                                        onIntent(SearchIntent.UpdateQuery(""))
                                     },
                                     icon = AppIcons.Close,
                                     contentDescription = stringResource(R.string.clear)
@@ -345,9 +393,9 @@ fun SearchScreen(
                 AppFloatingActionButton(
                     onClick = {
                         if (state.isSearching) {
-                            viewModel.onIntent(SearchIntent.StopSearch)
+                            onIntent(SearchIntent.StopSearch)
                         } else {
-                            viewModel.onIntent(SearchIntent.LoadMore)
+                            onIntent(SearchIntent.LoadMore)
                         }
                     },
                     icon = if (state.isSearching) Icons.Default.Stop else Icons.Default.PlayArrow,
@@ -371,14 +419,14 @@ fun SearchScreen(
                         state = state,
                         onUseHistory = { keyword ->
                             queryInput = keyword
-                            viewModel.onIntent(SearchIntent.UseHistoryKeyword(keyword))
+                            onIntent(SearchIntent.UseHistoryKeyword(keyword))
                         },
-                        onDeleteHistory = { viewModel.onIntent(SearchIntent.DeleteHistory(it)) },
+                        onDeleteHistory = { onIntent(SearchIntent.DeleteHistory(it)) },
                         onOpenBook = {
-                            viewModel.onIntent(SearchIntent.OpenBookshelfBook(it))
+                            onIntent(SearchIntent.OpenBookshelfBook(it))
                         },
                         onClearHistory = {
-                            viewModel.onIntent(SearchIntent.SetClearHistoryDialogVisible(true))
+                            onIntent(SearchIntent.SetClearHistoryDialogVisible(true))
                         },
                         modifier = Modifier.fillMaxSize(),
                     )
@@ -397,7 +445,7 @@ fun SearchScreen(
                                         hasMore = state.hasMore,
                                         hasResult = false,
                                         committedQuery = state.committedQuery,
-                                        onLoadMore = { viewModel.onIntent(SearchIntent.LoadMore) },
+                                        onLoadMore = { onIntent(SearchIntent.LoadMore) },
                                     )
                                 }
                             }
@@ -438,7 +486,7 @@ fun SearchScreen(
                                                     sourceName = group.sourceName,
                                                     items = group.items,
                                                     onClickBook = { book, coverKey ->
-                                                        viewModel.onIntent(
+                                                        onIntent(
                                                             SearchIntent.OpenSearchBook(
                                                                 book,
                                                                 coverKey
@@ -450,7 +498,7 @@ fun SearchScreen(
                                                         previewSharedCoverKey = coverKey
                                                     },
                                                     onViewAll = {
-                                                        viewModel.onIntent(
+                                                        onIntent(
                                                             SearchIntent.ExpandSource(
                                                                 group.origin,
                                                                 group.sourceName
@@ -460,6 +508,9 @@ fun SearchScreen(
                                                     sharedTransitionScope = sharedTransitionScope,
                                                     animatedVisibilityScope = animatedVisibilityScope,
                                                     sourceSectionIndex = groupIndex,
+                                                    qualityMaskForBook = { book ->
+                                                        state.contentQuality.results[qualityKey(book)]?.excluded == true
+                                                    },
                                                 )
                                             }
                                         }
@@ -470,7 +521,7 @@ fun SearchScreen(
                                                 hasMore = state.hasMore,
                                                 hasResult = true,
                                                 committedQuery = state.committedQuery,
-                                                onLoadMore = { viewModel.onIntent(SearchIntent.LoadMore) },
+                                                onLoadMore = { onIntent(SearchIntent.LoadMore) },
                                             )
                                         }
                                     }
@@ -492,16 +543,22 @@ fun SearchScreen(
                                                 item.book.bookUrl,
                                                 "search:${item.book.origin}"
                                             )
+                                            val qualityMasked =
+                                                state.contentQuality.results[qualityKey(item.book)]?.excluded == true
                                             SearchBookListItem(
                                                 book = item.book,
                                                 shelfState = item.shelfState,
-                                                onClick = {
-                                                    viewModel.onIntent(
-                                                        SearchIntent.OpenSearchBook(
-                                                            item.book,
-                                                            sharedCoverKey
+                                                onClick = if (qualityMasked) {
+                                                    null
+                                                } else {
+                                                    {
+                                                        onIntent(
+                                                            SearchIntent.OpenSearchBook(
+                                                                item.book,
+                                                                sharedCoverKey
+                                                            )
                                                         )
-                                                    )
+                                                    }
                                                 },
                                                 onLongClick = { book, coverKey ->
                                                     previewBook = book
@@ -509,7 +566,9 @@ fun SearchScreen(
                                                 },
                                                 sharedTransitionScope = sharedTransitionScope,
                                                 animatedVisibilityScope = animatedVisibilityScope,
-                                                sharedCoverKey = sharedCoverKey
+                                                sharedCoverKey = sharedCoverKey,
+                                                sourceCount = item.book.origins.size,
+                                                qualityMasked = qualityMasked,
                                             )
                                         }
 
@@ -519,7 +578,7 @@ fun SearchScreen(
                                                 hasMore = state.hasMore,
                                                 hasResult = true,
                                                 committedQuery = state.committedQuery,
-                                                onLoadMore = { viewModel.onIntent(SearchIntent.LoadMore) },
+                                                onLoadMore = { onIntent(SearchIntent.LoadMore) },
                                             )
                                         }
                                     }
@@ -566,22 +625,22 @@ fun SearchScreen(
     AppAlertDialog(
         show = state.showClearHistoryDialog,
         onDismissRequest = {
-            viewModel.onIntent(SearchIntent.SetClearHistoryDialogVisible(false))
+            onIntent(SearchIntent.SetClearHistoryDialogVisible(false))
         },
         title = stringResource(R.string.draw),
         text = stringResource(R.string.sure_clear_search_history),
         confirmText = stringResource(R.string.ok),
-        onConfirm = { viewModel.onIntent(SearchIntent.ConfirmClearHistory) },
+        onConfirm = { onIntent(SearchIntent.ConfirmClearHistory) },
         dismissText = stringResource(R.string.cancel),
         onDismiss = {
-            viewModel.onIntent(SearchIntent.SetClearHistoryDialogVisible(false))
+            onIntent(SearchIntent.SetClearHistoryDialogVisible(false))
         },
     )
 
     AppAlertDialog(
         data = state.emptyScopeAction,
         onDismissRequest = {
-            viewModel.onIntent(SearchIntent.DismissEmptyScopeAction)
+            onIntent(SearchIntent.DismissEmptyScopeAction)
         },
         title = stringResource(R.string.draw),
         textProvider = {
@@ -592,29 +651,38 @@ fun SearchScreen(
             }
         },
         confirmText = stringResource(R.string.ok),
-        onConfirm = { viewModel.onIntent(SearchIntent.ConfirmEmptyScopeAction) },
+        onConfirm = { onIntent(SearchIntent.ConfirmEmptyScopeAction) },
         dismissText = stringResource(R.string.cancel),
-        onDismiss = { viewModel.onIntent(SearchIntent.DismissEmptyScopeAction) },
+        onDismiss = { onIntent(SearchIntent.DismissEmptyScopeAction) },
     )
 
     ScopeSelectSheet(
         show = state.showScopeSheet,
-        onDismissRequest = { viewModel.onIntent(SearchIntent.SetScopeSheetVisible(false)) },
+        onDismissRequest = { onIntent(SearchIntent.SetScopeSheetVisible(false)) },
         isAll = state.isAllScope,
-        onSelectAll = { viewModel.onIntent(SearchIntent.SelectAllScope) },
+        onSelectAll = { onIntent(SearchIntent.SelectAllScope) },
         groups = state.enabledGroups,
         selectedGroups = state.scopeDisplayNames,
-        onToggleGroup = { viewModel.onIntent(SearchIntent.ToggleScopeGroup(it)) },
+        onToggleGroup = { onIntent(SearchIntent.ToggleScopeGroup(it)) },
         sources = state.enabledSources,
         selectedSources = state.selectedScopeSourceUrls,
-        onToggleSource = { viewModel.onIntent(SearchIntent.ToggleScopeSource(it)) },
+        onToggleSource = { onIntent(SearchIntent.ToggleScopeSource(it)) },
         isSourceScope = state.isSourceScope,
-        onConfirm = { viewModel.onIntent(SearchIntent.OpenSourceManage) },
+        onConfirm = { onIntent(SearchIntent.OpenSourceManage) },
+        onApplyScope = { selection ->
+            onIntent(
+                SearchIntent.ApplyScopeSelection(
+                    groupNames = selection.groupNames,
+                    sources = selection.sources,
+                    isSourceScope = selection.isSourceScope,
+                )
+            )
+        },
     )
 
     AppModalBottomSheet(
         show = state.showSettingsSheet,
-        onDismissRequest = { viewModel.onIntent(SearchIntent.SetSettingsSheetVisible(false)) },
+        onDismissRequest = { onIntent(SearchIntent.SetSettingsSheetVisible(false)) },
         title = stringResource(R.string.setting),
     ) {
         Column(
@@ -631,9 +699,16 @@ fun SearchScreen(
                 imageVector = if (isSourceGroupedMode) Icons.Default.GridView else Icons.AutoMirrored.Outlined.FormatListBulleted,
                 onValueChange = { newValue ->
                     if (newValue.toInt() != searchLayoutMode) {
-                        viewModel.toggleSearchLayout()
+                        onIntent(SearchIntent.SetLayoutMode(newValue.toInt()))
                     }
                 }
+            )
+
+            CompactClickableSettingItem(
+                title = stringResource(R.string.content_quality_detection),
+                description = stringResource(R.string.content_quality_detection_summary),
+                imageVector = Icons.Default.Book,
+                onClick = { onIntent(SearchIntent.OpenContentQuality) },
             )
 
             Row(
@@ -661,7 +736,7 @@ fun SearchScreen(
                     onToggleSelection = {
                         if (state.selectedSourceTypes.isNotEmpty()) {
                             state.selectedSourceTypes.forEach {
-                                viewModel.onIntent(SearchIntent.ToggleSourceType(it))
+                                onIntent(SearchIntent.ToggleSourceType(it))
                             }
                         }
                     }
@@ -678,7 +753,7 @@ fun SearchScreen(
                         containerColor = LegadoTheme.colorScheme.onSheetContent,
                         inSelectionMode = true,
                         onToggleSelection = {
-                            viewModel.onIntent(SearchIntent.ToggleSourceType(type))
+                            onIntent(SearchIntent.ToggleSourceType(type))
                         }
                     )
                 }
@@ -687,6 +762,12 @@ fun SearchScreen(
             Spacer(modifier = Modifier.height(20.dp))
         }
     }
+
+    ContentQualitySheet(
+        state = state.contentQuality,
+        resultCount = state.results.size,
+        onIntent = onIntent,
+    )
 
     val resultsByBookUrl = remember(state.results) {
         state.results.associateBy { it.book.bookUrl }
@@ -701,10 +782,10 @@ fun SearchScreen(
         onDismissRequest = { previewBook = null },
         onOpenDetail = { book, sharedCoverKey ->
             previewBook = null
-            viewModel.onIntent(SearchIntent.OpenSearchBook(book, sharedCoverKey))
+            onIntent(SearchIntent.OpenSearchBook(book, sharedCoverKey))
         },
         onAddToShelf = { book ->
-            viewModel.onAddToShelf(book)
+            onIntent(SearchIntent.AddToShelf(book))
         },
     )
 
@@ -717,19 +798,138 @@ fun SearchScreen(
         errorMsg = state.expandedSourceError,
         savedScrollIndex = state.expandedSourceSavedScrollIndex,
         savedScrollOffset = state.expandedSourceSavedScrollOffset,
-        onDismiss = { viewModel.onIntent(SearchIntent.DismissExpandedSource) },
-        onLoadMore = { viewModel.onIntent(SearchIntent.LoadMoreExpandedSource) },
+        onDismiss = { onIntent(SearchIntent.DismissExpandedSource) },
+        onLoadMore = { onIntent(SearchIntent.LoadMoreExpandedSource) },
         onSaveScrollState = { index, offset ->
-            viewModel.onIntent(SearchIntent.SaveExpandedSourceScrollState(index, offset))
+            onIntent(SearchIntent.SaveExpandedSourceScrollState(index, offset))
         },
         onBookClick = { book, coverKey ->
-            viewModel.onIntent(SearchIntent.OpenExpandedSourceBook(book, coverKey))
+            onIntent(SearchIntent.OpenExpandedSourceBook(book, coverKey))
         },
         onBookLongClick = { book, coverKey ->
             previewBook = book
             previewSharedCoverKey = coverKey
         },
     )
+}
+
+private fun qualityKey(book: SearchBook): String = "${book.origin}:${book.bookUrl}"
+
+@Composable
+private fun ContentQualitySheet(
+    state: ContentQualityUiState,
+    resultCount: Int,
+    onIntent: (SearchIntent) -> Unit,
+) {
+    AppModalBottomSheet(
+        show = state.showSheet,
+        onDismissRequest = { onIntent(SearchIntent.CloseContentQuality) },
+        title = stringResource(R.string.content_quality_detection),
+        endAction = {
+            SmallPlainButton(
+                onClick = { onIntent(SearchIntent.StartContentQuality) },
+                enabled = !state.isRunning && resultCount > 0,
+                icon = AppIcons.Check,
+                text = stringResource(R.string.content_quality_start),
+                contentDescription = stringResource(R.string.content_quality_start),
+            )
+        },
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            TextField(
+                value = state.chapterSpec,
+                onValueChange = { onIntent(SearchIntent.UpdateContentQualityChapterSpec(it)) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text(stringResource(R.string.content_quality_chapters)) },
+                supportingText = { Text(stringResource(R.string.content_quality_chapters_summary)) },
+                singleLine = true,
+            )
+            TextField(
+                value = state.keywords,
+                onValueChange = { onIntent(SearchIntent.UpdateContentQualityKeywords(it)) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text(stringResource(R.string.content_quality_keywords)) },
+                supportingText = { Text(stringResource(R.string.content_quality_keywords_summary)) },
+                singleLine = true,
+            )
+            TextField(
+                value = state.skipHeadChars,
+                onValueChange = { onIntent(SearchIntent.UpdateContentQualitySkipHeadChars(it)) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text(stringResource(R.string.content_quality_skip_chars)) },
+                supportingText = { Text(stringResource(R.string.content_quality_skip_chars_summary)) },
+                singleLine = true,
+            )
+
+            AppText(
+                text = stringResource(R.string.content_quality_pipeline),
+                style = LegadoTheme.typography.labelMediumEmphasized,
+                color = LegadoTheme.colorScheme.onSurfaceVariant,
+            )
+            ContentQualityPipeline(stage = state.stage)
+
+            if (state.isRunning) {
+                val progress = if (state.totalBooks == 0) null else {
+                    state.processedBooks.toFloat() / state.totalBooks
+                }
+                AppCircularProgressIndicator(progress = progress)
+                AppText(
+                    text = stringResource(
+                        R.string.content_quality_progress,
+                        state.processedBooks,
+                        state.totalBooks,
+                        state.currentBookName,
+                    ),
+                    style = LegadoTheme.typography.bodySmall,
+                )
+            } else if (state.results.isNotEmpty()) {
+                val excludedCount = state.results.values.count { it.excluded }
+                AppText(
+                    text = stringResource(
+                        R.string.content_quality_result,
+                        state.results.size,
+                        excludedCount,
+                    ),
+                    style = LegadoTheme.typography.bodySmall,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ContentQualityPipeline(stage: ContentQualityStage?) {
+    val stages = listOf(
+        ContentQualityStage.ChapterCount to R.string.content_quality_stage_chapter_count,
+        ContentQualityStage.ContentCleaning to R.string.content_quality_stage_cleaning,
+        ContentQualityStage.KeywordMatching to R.string.content_quality_stage_matching,
+        ContentQualityStage.Excluding to R.string.content_quality_stage_excluding,
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        stages.forEachIndexed { index, (itemStage, labelRes) ->
+            val color = when {
+                stage == ContentQualityStage.Completed || stage == itemStage -> LegadoTheme.colorScheme.primary
+                stage != null && stage.ordinal > itemStage.ordinal -> LegadoTheme.colorScheme.secondary
+                else -> LegadoTheme.colorScheme.onSurfaceVariant
+            }
+            AppText(
+                text = stringResource(labelRes),
+                color = color,
+                style = LegadoTheme.typography.labelSmall,
+                maxLines = 1,
+            )
+            if (index < stages.lastIndex) {
+                AppText(text = "→", color = LegadoTheme.colorScheme.outline)
+            }
+        }
+    }
 }
 
 private data class SearchFloatingSummary(

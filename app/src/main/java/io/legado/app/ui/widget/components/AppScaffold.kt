@@ -1,9 +1,9 @@
 package io.legado.app.ui.widget.components
 
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -19,12 +19,17 @@ import androidx.compose.ui.draw.blur
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
-import coil.compose.AsyncImage
+import coil3.compose.AsyncImage
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
-import io.legado.app.ui.config.themeConfig.ThemeConfig
+import io.legado.app.domain.model.settings.hasBackgroundImage
 import io.legado.app.ui.theme.LegadoTheme
+import io.legado.app.ui.theme.LocalAppUiConfiguration
 import io.legado.app.ui.theme.LocalHazeState
+import io.legado.app.ui.theme.LocalTopBarBackdrop
 import io.legado.app.ui.theme.ThemeResolver
 import io.legado.app.ui.theme.responsiveHazeSource
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -46,12 +51,15 @@ fun AppScaffold(
     disableHazeSource: Boolean = false,
     content: @Composable (PaddingValues) -> Unit
 ) {
-    val isDark = isSystemInDarkTheme()
-    val hasImageBg = ThemeConfig.hasImageBg(isDark)
+    val isDark = LegadoTheme.isDark
+    val configuration = LocalAppUiConfiguration.current
+    val themeSettings = configuration.theme
+    val hasImageBg = themeSettings.hasBackgroundImage(isDark)
     val hazeState = remember { HazeState() }
+    val liquidGlassEnabled = configuration.theme.topBarButtonStyle == "liquid"
     val composeEngine = LegadoTheme.composeEngine
     val contentDrawsBehindBars =
-        alwaysDrawBehindBars || ThemeConfig.enableBlur || ThemeConfig.enableProgressiveBlur
+        alwaysDrawBehindBars || themeSettings.enableBlur || themeSettings.enableProgressiveBlur
 
     val containerColor = if (hasImageBg) {
         Color.Transparent
@@ -64,9 +72,20 @@ fun AppScaffold(
     } else {
         MiuixTheme.colorScheme.surface
     }
+    val topBarBackdropBaseColor = LegadoTheme.colorScheme.background
+    val topBarBackgroundBackdrop = rememberLayerBackdrop {
+        drawRect(topBarBackdropBaseColor)
+        drawContent()
+    }
+    val topBarContentBackdrop = rememberLayerBackdrop { drawContent() }
+    val topBarBackdrop = rememberCombinedBackdrop(
+        topBarBackgroundBackdrop,
+        topBarContentBackdrop
+    )
 
     CompositionLocalProvider(
-        LocalHazeState provides if (ThemeConfig.enableBlur) hazeState else null
+        LocalHazeState provides if (themeSettings.enableBlur) hazeState else null,
+        LocalTopBarBackdrop provides if (liquidGlassEnabled) topBarBackdrop else null,
     ) {
         when {
             ThemeResolver.isMiuixEngine(composeEngine) -> {
@@ -76,7 +95,19 @@ fun AppScaffold(
                     else -> MiuixFabPosition.End
                 }
                 Box(modifier = modifier.fillMaxSize()) {
-                    BackgroundImageContent(isDark = isDark, hazeState = hazeState)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .then(
+                                if (liquidGlassEnabled) {
+                                    Modifier.layerBackdrop(topBarBackgroundBackdrop)
+                                } else {
+                                    Modifier
+                                }
+                            )
+                    ) {
+                        BackgroundImageContent(isDark = isDark, hazeState = hazeState)
+                    }
                     MiuixScaffold(
                         modifier = Modifier.fillMaxSize(),
                         topBar = {
@@ -89,7 +120,7 @@ fun AppScaffold(
                         containerColor = miuixContainerColor,
                         contentWindowInsets = contentWindowInsets
                     ) { paddingValues ->
-                        val scaffoldPadding = if (ThemeConfig.useFloatingBottomBar) {
+                        val scaffoldPadding = if (configuration.appShell.useFloatingBottomBar) {
                             PaddingValues(top = paddingValues.calculateTopPadding())
                         } else {
                             paddingValues
@@ -98,12 +129,21 @@ fun AppScaffold(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .then(
+                                    if (liquidGlassEnabled) {
+                                        Modifier.layerBackdrop(topBarContentBackdrop)
+                                    } else {
+                                        Modifier
+                                    }
+                                )
+                                .then(
                                     if (!disableHazeSource) Modifier.responsiveHazeSource(hazeState)
                                     else Modifier
                                 )
                                 .then(
                                     if (contentDrawsBehindBars) Modifier
-                                    else Modifier.padding(scaffoldPadding)
+                                    else Modifier
+                                        .padding(scaffoldPadding)
+                                        .consumeWindowInsets(scaffoldPadding)
                                 )
                         ) {
                             content(
@@ -117,7 +157,19 @@ fun AppScaffold(
 
             else -> {
                 Box(modifier = modifier.fillMaxSize()) {
-                    BackgroundImageContent(isDark = isDark, hazeState = hazeState)
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .then(
+                                if (liquidGlassEnabled) {
+                                    Modifier.layerBackdrop(topBarBackgroundBackdrop)
+                                } else {
+                                    Modifier
+                                }
+                            )
+                    ) {
+                        BackgroundImageContent(isDark = isDark, hazeState = hazeState)
+                    }
                     Scaffold(
                         modifier = Modifier.fillMaxSize(),
                         topBar = {
@@ -131,7 +183,7 @@ fun AppScaffold(
                         contentColor = contentColor,
                         contentWindowInsets = contentWindowInsets
                     ) { paddingValues ->
-                        val scaffoldPadding = if (ThemeConfig.useFloatingBottomBar) {
+                        val scaffoldPadding = if (configuration.appShell.useFloatingBottomBar) {
                             PaddingValues(top = paddingValues.calculateTopPadding())
                         } else {
                             paddingValues
@@ -140,12 +192,21 @@ fun AppScaffold(
                             modifier = Modifier
                                 .fillMaxSize()
                                 .then(
+                                    if (liquidGlassEnabled) {
+                                        Modifier.layerBackdrop(topBarContentBackdrop)
+                                    } else {
+                                        Modifier
+                                    }
+                                )
+                                .then(
                                     if (!disableHazeSource) Modifier.responsiveHazeSource(hazeState)
                                     else Modifier
                                 )
                                 .then(
                                     if (contentDrawsBehindBars) Modifier
-                                    else Modifier.padding(scaffoldPadding)
+                                    else Modifier
+                                        .padding(scaffoldPadding)
+                                        .consumeWindowInsets(scaffoldPadding)
                                 )
                         ) {
                             content(
@@ -166,16 +227,21 @@ private fun BackgroundImageContent(
     isDark: Boolean,
     hazeState: HazeState
 ) {
-    val hasImageBg = ThemeConfig.hasImageBg(isDark)
-    val bgImagePath = if (isDark) ThemeConfig.bgImageDark else ThemeConfig.bgImageLight
-    val blur = if (isDark) {
-        ThemeConfig.bgImageNBlurring
+    val themeSettings = LocalAppUiConfiguration.current.theme
+    val hasImageBg = themeSettings.hasBackgroundImage(isDark)
+    val bgImagePath = if (isDark) {
+        themeSettings.backgroundImageDark
     } else {
-        ThemeConfig.bgImageBlurring
+        themeSettings.backgroundImageLight
+    }
+    val blur = if (isDark) {
+        themeSettings.backgroundImageDarkBlurring
+    } else {
+        themeSettings.backgroundImageBlurring
     }
 
     if (hasImageBg && !bgImagePath.isNullOrBlank()) {
-        if (ThemeConfig.enableBlur) {
+        if (themeSettings.enableBlur) {
             AsyncImage(
                 model = bgImagePath,
                 contentDescription = null,

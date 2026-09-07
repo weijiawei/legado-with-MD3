@@ -12,11 +12,11 @@ import io.legado.app.data.appDb
 import io.legado.app.data.entities.Book
 import io.legado.app.data.entities.BookChapter
 import io.legado.app.data.entities.BookSource
-import io.legado.app.help.config.AppConfig
-import io.legado.app.ui.config.otherConfig.OtherConfig
 import io.legado.app.model.analyzeRule.AnalyzeUrl
 import io.legado.app.model.localBook.LocalBook
 import io.legado.app.model.localBook.TextFile
+import io.legado.app.domain.gateway.DownloadCacheSettingsGateway
+import io.legado.app.domain.gateway.ReadSettingsGateway
 import io.legado.app.utils.ArchiveUtils
 import io.legado.app.utils.FileUtils
 import io.legado.app.utils.ImageUtils
@@ -37,12 +37,16 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.asFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.apache.commons.text.similarity.JaccardSimilarity
+import org.koin.core.context.GlobalContext
 import splitties.init.appCtx
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -51,7 +55,6 @@ import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.util.concurrent.ConcurrentHashMap
-import java.util.regex.Pattern
 import java.util.zip.ZipFile
 import kotlin.math.abs
 import kotlin.math.max
@@ -59,6 +62,10 @@ import kotlin.math.min
 
 @Suppress("unused", "ConstPropertyName")
 object BookHelp {
+    private val readGateway by lazy { GlobalContext.get().get<ReadSettingsGateway>() }
+    private val cacheGateway by lazy { GlobalContext.get().get<DownloadCacheSettingsGateway>() }
+
+    private const val CACHED_CONTENT_PREFIX_LENGTH = 1_024
     private val downloadDir: File = appCtx.externalFiles
     private const val cacheFolderName = "book_cache"
     private const val cacheImageFolderName = "images"
@@ -133,25 +140,24 @@ object BookHelp {
     private fun clearComicCache(book: Book) {
         //只处理漫画
         //为0的时候，不清除已缓存数据
-        if (!book.isImage || AppConfig.imageRetainNum == 0) {
+        if (!book.isImage || cacheGateway.currentSettings.imageRetainNum == 0) {
             return
         }
         //向前保留设定数量，向后保留预下载数量
-        val startIndex = book.durChapterIndex - AppConfig.imageRetainNum
-        val endIndex = book.durChapterIndex + AppConfig.preDownloadNum
+        val startIndex = book.durChapterIndex - cacheGateway.currentSettings.imageRetainNum
+        val endIndex = book.durChapterIndex + readGateway.currentSettings.preDownloadNum
         val chapterList = appDb.bookChapterDao.getChapterList(book.bookUrl, startIndex, endIndex)
         val imgNames = hashSetOf<String>()
         //获取需要保留章节的图片信息
         chapterList.forEach {
-            val content = getContent(book, it)
-            if (content != null) {
-                val matcher = AppPattern.imgPattern.matcher(content)
-                while (matcher.find()) {
-                    val src = matcher.group(1) ?: continue
-                    val mSrc = NetworkUtils.getAbsoluteURL(it.url, src)
-                    imgNames.add("${MD5Utils.md5Encode16(mSrc)}.${getImageSuffix(mSrc)}")
+                val content = getContent(book, it)
+                if (content != null) {
+                    for (m in AppPattern.imgPattern.findAll(content)) {
+                        val src = m.groupValues[1].takeIf { it.isNotEmpty() } ?: continue
+                        val mSrc = NetworkUtils.getAbsoluteURL(it.url, src)
+                        imgNames.add("${MD5Utils.md5Encode16(mSrc)}.${getImageSuffix(mSrc)}")
+                    }
                 }
-            }
         }
         downloadDir.getFile(
             cacheFolderName,
@@ -202,7 +208,7 @@ object BookHelp {
             book.getFolderName(),
             bookChapter.getFileName(),
         ).writeText(content)
-        if (book.isOnLineTxt && AppConfig.tocCountWords) {
+        if (book.isOnLineTxt && readGateway.currentSettings.tocCountWords) {
             val wordCount = StringUtils.wordCountFormat(content.length)
             bookChapter.wordCount = wordCount
             appDb.bookChapterDao.update(bookChapter)
@@ -276,35 +282,63 @@ object BookHelp {
 
     fun flowImages(bookChapter: BookChapter, content: String): Flow<String> {
         return flow {
-            val matcher = AppPattern.imgPattern.matcher(content)
-            while (matcher.find()) {
-                val src = matcher.group(1) ?: continue
+            for (m in AppPattern.imgPattern.findAll(content)) {
+                val src = m.groupValues[1].takeIf { it.isNotEmpty() } ?: continue
                 val mSrc = NetworkUtils.getAbsoluteURL(bookChapter.url, src)
                 emit(mSrc)
             }
         }
     }
 
+    fun countImagesInContent(bookChapter: BookChapter, content: String): Int {
+        var count = 0
+        for (m in AppPattern.imgPattern.findAll(content)) {
+            if (m.groupValues[1].isNotEmpty()) count++
+        }
+        return count
+    }
+
+    /**
+     * @return 失败的图片数量（0 表示全部成功或无需下载）
+     */
     suspend fun saveImages(
         bookSource: BookSource,
         book: Book,
         bookChapter: BookChapter,
         content: String,
-        concurrency: Int = OtherConfig.threadCount
-    ) = coroutineScope {
-        flowImages(bookChapter, content).onEachParallel(concurrency) { mSrc ->
-            saveImage(bookSource, book, mSrc, bookChapter)
+        concurrency: Int = cacheGateway.currentSettings.threadCount,
+        onProgress: (suspend (completed: Int, total: Int) -> Unit)? = null,
+    ): Int = coroutineScope {
+        val imageUrls = flowImages(bookChapter, content).toList()
+        val total = imageUrls.size
+        onProgress?.invoke(0, total)
+        if (total == 0) return@coroutineScope 0
+        val progressMutex = Mutex()
+        var completed = 0
+        var failures = 0
+        imageUrls.asFlow().onEachParallel(concurrency) { mSrc ->
+            val ok = saveImage(bookSource, book, mSrc, bookChapter)
+            progressMutex.withLock {
+                if (!ok) failures++
+                completed++
+                onProgress?.invoke(completed, total)
+            }
         }.collect()
+        failures
     }
 
+    /**
+     * @return true 表示图片已存在，或本次下载且校验通过。
+     * 数据异常时仍会落盘（避免反复拉坏图），但返回 false 以便调用方记失败。
+     */
     suspend fun saveImage(
         bookSource: BookSource?,
         book: Book,
         src: String,
         chapter: BookChapter? = null
-    ) {
+    ): Boolean {
         if (isImageExist(book, src)) {
-            return
+            return true
         }
         val mutex = synchronized(this) {
             downloadImages.getOrPut(src) { Mutex() }
@@ -312,7 +346,7 @@ object BookHelp {
         mutex.lock()
         try {
             if (isImageExist(book, src)) {
-                return
+                return true
             }
             imageDownloadSlots.acquire()
             try {
@@ -323,24 +357,29 @@ object BookHelp {
                     analyzeUrl.getInputStreamAwait().use {
                         writeImage(book, src, it)
                     }
+                    return true
                 } else {
                     imageDecodeSlots.acquire()
                     try {
                         val bytes = analyzeUrl.getByteArrayAwait()
                         //某些图片被加密，需要进一步解密
-                        runScriptWithContext {
+                        val decoded = runScriptWithContext {
                             ImageUtils.decode(
                                 src, bytes, isCover = false, bookSource, book
                             )
-                        }?.let {
-                            if (!checkImage(it)) {
-                                // 如果部分图片失效，每次进入正文都会花很长时间再次获取图片数据
-                                // 所以无论如何都要将数据写入到文件里
-                                // throw NoStackTraceException("数据异常")
-                                AppLog.put("${book.name} ${chapter?.title} 图片 $src 下载错误 数据异常")
-                            }
-                            writeImage(book, src, it)
                         }
+                        if (decoded == null) {
+                            AppLog.put("${book.name} ${chapter?.title} 图片 $src 下载失败 解码为空")
+                            return false
+                        }
+                        // 如果部分图片失效，每次进入正文都会花很长时间再次获取图片数据
+                        // 所以无论如何都要将数据写入到文件里；但仍记失败，避免章节被标为已缓存
+                        writeImage(book, src, decoded)
+                        if (!checkImage(decoded)) {
+                            AppLog.put("${book.name} ${chapter?.title} 图片 $src 下载错误 数据异常")
+                            return false
+                        }
+                        return true
                     } finally {
                         imageDecodeSlots.release()
                     }
@@ -352,10 +391,29 @@ object BookHelp {
             currentCoroutineContext().ensureActive()
             val msg = "${book.name} ${chapter?.title} 图片 $src 下载失败\n${e.localizedMessage}"
             AppLog.put(msg, e)
+            return false
         } finally {
             downloadImages.remove(src)
             mutex.unlock()
         }
+    }
+
+    /**
+     * 一次 saveImages 批次是否可视为章节图片缓存完成。
+     */
+    fun isChapterImageCacheComplete(failures: Int, filesCached: Boolean): Boolean {
+        return io.legado.app.help.book.isChapterImageCacheComplete(failures, filesCached)
+    }
+
+    fun isChapterImageCacheComplete(
+        book: Book,
+        bookChapter: BookChapter,
+        failures: Int,
+    ): Boolean {
+        return io.legado.app.help.book.isChapterImageCacheComplete(
+            failures,
+            hasImageFilesCached(book, bookChapter),
+        )
     }
 
     fun getImage(book: Book, src: String): File {
@@ -464,6 +522,20 @@ object BookHelp {
     /**
      * 检测该章节是否下载
      */
+    fun countCachedChapters(book: Book): Int {
+        return appDb.bookChapterDao.getChapterList(book.bookUrl).count { chapter ->
+            chapter.isVolume || isChapterCacheComplete(book, chapter)
+        }
+    }
+
+    fun isChapterCacheComplete(book: Book, bookChapter: BookChapter): Boolean {
+        return if (book.isLocal) {
+            hasContent(book, bookChapter)
+        } else {
+            hasImageFilesCached(book, bookChapter)
+        }
+    }
+
     fun hasContent(book: Book, bookChapter: BookChapter): Boolean {
         return if (book.isLocalTxt ||
             (bookChapter.isVolume && bookChapter.url.startsWith(bookChapter.title))
@@ -479,7 +551,24 @@ object BookHelp {
     }
 
     /**
-     * 检测图片是否下载
+     * UI/队列用：仅检查图片文件是否都存在，不做 bitmap 解码校验。
+     */
+    fun hasImageFilesCached(book: Book, bookChapter: BookChapter): Boolean {
+        if (!hasContent(book, bookChapter)) {
+            return false
+        }
+        var ret = true
+        forEachImageSrc(book, bookChapter) { src ->
+            if (!isImageExist(book, src)) {
+                ret = false
+                return@forEachImageSrc
+            }
+        }
+        return ret
+    }
+
+    /**
+     * 检测图片是否下载（含 bitmap 解码校验，用于实际下载决策）
      */
     fun hasImageContent(book: Book, bookChapter: BookChapter): Boolean {
         if (!hasContent(book, bookChapter)) {
@@ -517,13 +606,15 @@ object BookHelp {
             bookChapter.getFileName()
         )
         if (file.exists()) {
-            forEachImageSrc(file, action)
+            forEachImageSrc(file) { src ->
+                action(NetworkUtils.getAbsoluteURL(bookChapter.url, src))
+            }
             return
         }
         getContent(book, bookChapter)?.let { content ->
-            val matcher = AppPattern.imgPattern.matcher(content)
-            while (matcher.find()) {
-                action(matcher.group(1) ?: continue)
+            for (m in AppPattern.imgPattern.findAll(content)) {
+                val src = m.groupValues[1].takeIf { it.isNotEmpty() } ?: continue
+                action(NetworkUtils.getAbsoluteURL(bookChapter.url, src))
             }
         }
     }
@@ -547,11 +638,11 @@ object BookHelp {
         buffer: StringBuilder,
         action: (String) -> Unit
     ) {
-        val matcher = AppPattern.imgPattern.matcher(buffer)
         var lastEnd = 0
-        while (matcher.find()) {
-            action(matcher.group(1) ?: continue)
-            lastEnd = matcher.end()
+        for (m in AppPattern.imgPattern.findAll(buffer)) {
+            val src = m.groupValues[1].takeIf { it.isNotEmpty() } ?: continue
+            action(src)
+            lastEnd = m.range.last + 1
         }
         if (lastEnd > 0) {
             buffer.delete(0, lastEnd)
@@ -614,6 +705,58 @@ object BookHelp {
         }
         return null
     }
+
+    /**
+     * 只统计已经落盘的章节缓存，不读取本地书源，也不会触发网络请求。
+     */
+    fun getCachedContentLength(book: Book, bookChapter: BookChapter): Int? {
+        return getCachedContentInfo(book, bookChapter)?.contentLength
+    }
+
+    /**
+     * 流式读取已落盘正文，只保留用于页数缓存校验的短前缀，不加载本地书源或网络正文。
+     */
+    fun getCachedContentInfo(book: Book, bookChapter: BookChapter): CachedContentInfo? {
+        val file = downloadDir.getFile(
+            cacheFolderName,
+            book.getFolderName(),
+            bookChapter.getFileName()
+        )
+        if (!file.isFile) return null
+
+        return try {
+            var length = 0L
+            val prefix = StringBuilder(CACHED_CONTENT_PREFIX_LENGTH)
+            file.bufferedReader().use { reader ->
+                val buffer = CharArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val readCount = reader.read(buffer)
+                    if (readCount < 0) break
+                    length += readCount
+                    if (prefix.length < CACHED_CONTENT_PREFIX_LENGTH) {
+                        prefix.append(
+                            buffer,
+                            0,
+                            min(readCount, CACHED_CONTENT_PREFIX_LENGTH - prefix.length),
+                        )
+                    }
+                    if (length > Int.MAX_VALUE) {
+                        return CachedContentInfo(Int.MAX_VALUE, prefix.toString())
+                    }
+                }
+            }
+            length.toInt().takeIf { it > 0 }?.let {
+                CachedContentInfo(it, prefix.toString())
+            }
+        } catch (_: IOException) {
+            null
+        }
+    }
+
+    data class CachedContentInfo(
+        val contentLength: Int,
+        val prefix: String,
+    )
 
     /**
      * 删除章节内容
@@ -750,14 +893,14 @@ object BookHelp {
     }
 
     private val chapterNamePattern1 by lazy {
-        Pattern.compile(
+        Regex(
             ".*?第([\\d零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+)[章节篇回集话]"
         )
     }
 
     @Suppress("RegExpSimplifiable")
     private val chapterNamePattern2 by lazy {
-        Pattern.compile(
+        Regex(
             "^(?:[\\d零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+[,:、])*([\\d零〇一二两三四五六七八九十百千万壹贰叁肆伍陆柒捌玖拾佰仟]+)(?:[,:、]|\\.[^\\d])"
         )
     }
@@ -771,10 +914,9 @@ object BookHelp {
         val chapterName1 = StringUtils.fullToHalf(chapterName).replace(regexA, "")
         return StringUtils.stringToInt(
             (
-                    chapterNamePattern1.matcher(chapterName1).takeIf { it.find() }
-                        ?: chapterNamePattern2.matcher(chapterName1).takeIf { it.find() }
-                    )?.group(1)
-                ?: "-1"
+                    chapterNamePattern1.find(chapterName1)?.groups?.get(1)?.value
+                        ?: chapterNamePattern2.find(chapterName1)?.groups?.get(1)?.value
+                    ) ?: "-1"
         )
     }
 
